@@ -8,9 +8,13 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -115,7 +119,8 @@ type NameshiftCertGetter struct {
 	// the described handshake, the endpoint should return HTTP 204
 	// (No Content). Error statuses will indicate that the manager is
 	// capable of providing a certificate but was unable to.
-	URL string `json:"url,omitempty"`
+	URL        string `json:"url,omitempty"`
+	LocalCache string `json:"local_cache,omitempty"`
 
 	logger        *zap.Logger
 	ctx           context.Context
@@ -141,7 +146,60 @@ func (hcg *NameshiftCertGetter) Provision(ctx caddy.Context) error {
 		return fmt.Errorf("URL is required")
 	}
 
+	if hcg.LocalCache != "" {
+		hcg.logger.Debug(fmt.Sprintf("Loading local certificates from cache: %s", hcg.LocalCache))
+
+		files, err := os.ReadDir(hcg.LocalCache)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		for _, file := range files {
+			if !file.IsDir() {
+				// grab contents
+				hcg.logger.Debug(fmt.Sprintf("Loading certificate %s from disk", file.Name()))
+
+				fullname := filepath.Join(hcg.LocalCache, file.Name())
+				contents, err := os.ReadFile(fullname)
+				if err != nil {
+					log.Fatal(err)
+				}
+
+				// see if it's valid cert
+				cert, err := tlsCertFromCertAndKeyPEMBundle(contents)
+				if err == nil {
+					if time.Now().After(cert.Leaf.NotAfter) {
+						hcg.logger.Debug(fmt.Sprintf("Certificate %s expired: %s", file.Name(), cert.Leaf.NotAfter))
+						os.Remove(fullname)
+						continue
+					}
+
+					hcg.loadCertificateIntoMemoryCache(file.Name(), cert)
+				}
+			}
+		}
+	}
+
 	return nil
+}
+
+func (hcg NameshiftCertGetter) storeCertificateToDisk(id string, cert []byte) {
+	os.WriteFile(
+		filepath.Join(hcg.LocalCache, id),
+		cert,
+		0644,
+	)
+}
+
+func (hcg NameshiftCertGetter) loadCertificateIntoMemoryCache(id string, cert tls.Certificate) {
+	// store in cache
+	hcg.certificates[id] = cert
+
+	hcg.logger.Debug(fmt.Sprintf("Storing certificate %s in cache. DNS Names: %s", id, cert.Leaf.DNSNames))
+
+	for _, element := range cert.Leaf.DNSNames {
+		hcg.domainCertMap[element] = id
+	}
 }
 
 func (hcg NameshiftCertGetter) GetCertificate(ctx context.Context, hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
@@ -195,19 +253,15 @@ func (hcg NameshiftCertGetter) GetCertificate(ctx context.Context, hello *tls.Cl
 		fmt.Println("Can not unmarshal JSON")
 	}
 
-	cert, err := tlsCertFromCertAndKeyPEMBundle([]byte(result.Certificate))
+	pem := []byte(result.Certificate)
+
+	cert, err := tlsCertFromCertAndKeyPEMBundle(pem)
 	if err != nil {
 		return nil, err
 	}
 
-	// store in cache
-	hcg.certificates[result.Id] = cert
-
-	hcg.logger.Debug(fmt.Sprintf("Storing certificate %s in cache. DNS Names: %s", result.Id, cert.Leaf.DNSNames))
-
-	for _, element := range cert.Leaf.DNSNames {
-		hcg.domainCertMap[element] = result.Id
-	}
+	hcg.loadCertificateIntoMemoryCache(result.Id, cert)
+	hcg.storeCertificateToDisk(result.Id, pem)
 
 	return &cert, nil
 }
@@ -218,17 +272,31 @@ func (hcg NameshiftCertGetter) GetCertificate(ctx context.Context, hello *tls.Cl
 func (hcg *NameshiftCertGetter) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	d.Next() // consume cert manager name
 
-	if !d.NextArg() {
-		return d.ArgErr()
+	if d.NextArg() {
+		hcg.URL = d.Val()
 	}
-	hcg.URL = d.Val()
 
 	if d.NextArg() {
 		return d.ArgErr()
 	}
-	if d.NextBlock(0) {
-		return d.Err("block not allowed here")
+
+	for d.NextBlock(0) {
+		switch d.Val() {
+		case "local_cache":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			hcg.LocalCache = d.Val()
+		case "url":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			hcg.URL = d.Val()
+		default:
+			return d.Errf("unrecognized subdirective %q", d.Val())
+		}
 	}
+
 	return nil
 }
 
