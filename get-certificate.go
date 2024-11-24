@@ -1,4 +1,4 @@
-package httpredirect
+package nameshift
 
 import (
 	"bytes"
@@ -102,6 +102,11 @@ type CertificateResponse struct {
 	Certificate string `json:"certificate"`
 }
 
+var (
+	domainCertMap map[string]string
+	certificates  map[string]tls.Certificate
+)
+
 // NameshiftCertGetter can get a certificate via HTTP(S) request.
 type NameshiftCertGetter struct {
 	// The URL from which to download the certificate. Required.
@@ -122,10 +127,8 @@ type NameshiftCertGetter struct {
 	URL        string `json:"url,omitempty"`
 	LocalCache string `json:"local_cache,omitempty"`
 
-	logger        *zap.Logger
-	ctx           context.Context
-	domainCertMap map[string]string
-	certificates  map[string]tls.Certificate
+	logger *zap.Logger
+	ctx    context.Context
 }
 
 // CaddyModule returns the Caddy module information.
@@ -139,8 +142,8 @@ func (hcg NameshiftCertGetter) CaddyModule() caddy.ModuleInfo {
 func (hcg *NameshiftCertGetter) Provision(ctx caddy.Context) error {
 	hcg.ctx = ctx
 	hcg.logger = ctx.Logger(hcg)
-	hcg.domainCertMap = make(map[string]string)
-	hcg.certificates = make(map[string]tls.Certificate)
+	domainCertMap = make(map[string]string)
+	certificates = make(map[string]tls.Certificate)
 
 	if hcg.URL == "" {
 		return fmt.Errorf("URL is required")
@@ -165,7 +168,8 @@ func (hcg *NameshiftCertGetter) Provision(ctx caddy.Context) error {
 					log.Fatal(err)
 				}
 
-				// see if it's valid cert
+				// @TODO @mastercoding Order certificates by expiry date desc and don't
+				// override domainMap[cert] if it already has one
 				cert, err := tlsCertFromCertAndKeyPEMBundle(contents)
 				if err == nil {
 					if time.Now().After(cert.Leaf.NotAfter) {
@@ -191,29 +195,25 @@ func (hcg NameshiftCertGetter) storeCertificateToDisk(id string, cert []byte) {
 	)
 }
 
+func HasCertificate(name string) bool {
+	_, ok := domainCertMap[name]
+
+	return ok
+}
+
 func (hcg NameshiftCertGetter) loadCertificateIntoMemoryCache(id string, cert tls.Certificate) {
 	// store in cache
-	hcg.certificates[id] = cert
+	certificates[id] = cert
 
 	hcg.logger.Debug(fmt.Sprintf("Storing certificate %s in cache. DNS Names: %s", id, cert.Leaf.DNSNames))
 
 	for _, element := range cert.Leaf.DNSNames {
-		hcg.domainCertMap[element] = id
+		domainCertMap[element] = id
 	}
 }
 
-func (hcg NameshiftCertGetter) GetCertificate(ctx context.Context, hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-
-	// check if we have the certificate cached
-	certificateId, ok := hcg.domainCertMap[hello.ServerName]
-	if ok {
-		hcg.logger.Debug(fmt.Sprintf("Cached certificate found for %s. Certificate id: %s", hello.ServerName, certificateId))
-
-		cert := hcg.certificates[certificateId]
-		return &cert, nil
-	}
-
-	hcg.logger.Debug(fmt.Sprintf("No cached certificate found for %s. Fetching from API.", hello.ServerName))
+func (hcg NameshiftCertGetter) fetchCertificate(name string) (*tls.Certificate, error) {
+	hcg.logger.Debug(fmt.Sprintf("Fetching certificate from API for %s.", name))
 
 	parsed, err := url.Parse(hcg.URL)
 	if err != nil {
@@ -221,7 +221,7 @@ func (hcg NameshiftCertGetter) GetCertificate(ctx context.Context, hello *tls.Cl
 	}
 
 	qs := parsed.Query()
-	qs.Set("server_name", hello.ServerName)
+	qs.Set("server_name", name)
 	parsed.RawQuery = qs.Encode()
 
 	req, err := http.NewRequestWithContext(hcg.ctx, http.MethodGet, parsed.String(), nil)
@@ -264,6 +264,34 @@ func (hcg NameshiftCertGetter) GetCertificate(ctx context.Context, hello *tls.Cl
 	hcg.storeCertificateToDisk(result.Id, pem)
 
 	return &cert, nil
+}
+
+func (hcg NameshiftCertGetter) GetCertificate(ctx context.Context, hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+
+	name := hello.ServerName
+
+	// check if we have the certificate cached
+	certificateId, ok := domainCertMap[name]
+	if ok {
+		hcg.logger.Debug(fmt.Sprintf("Cached certificate found for %s. Certificate id: %s", name, certificateId))
+		cert := certificates[certificateId]
+
+		// check if expired
+		if time.Now().After(cert.Leaf.NotAfter) {
+			hcg.logger.Debug(fmt.Sprintf("Cached certificate for %s was expired, removing. Certificate id: %s", name, certificateId))
+			delete(certificates, certificateId)
+		} else {
+			// epxires soon
+			if time.Now().AddDate(0, 0, -5).After(cert.Leaf.NotAfter) {
+				hcg.logger.Debug(fmt.Sprintf("Cached certificate for %s is expiring soon (%s), fetching new one. Certificate id: %s", name, cert.Leaf.NotAfter, certificateId))
+				defer hcg.fetchCertificate(name)
+			}
+
+			return &cert, nil
+		}
+	}
+
+	return hcg.fetchCertificate(name)
 }
 
 // UnmarshalCaddyfile deserializes Caddyfile tokens into ts.
