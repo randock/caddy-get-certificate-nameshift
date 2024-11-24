@@ -72,8 +72,8 @@ func (h *Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 		h.logger.Error(err.Error())
 	}
 
-	h.logger.Debug(fmt.Sprintf("Checking certificate for %s: %t", r.Host, exists))
 	exists := HasCertificate(requestHost) || len(caddytls.AllMatchingCertificates(requestHost)) > 0
+	h.logger.Debug(fmt.Sprintf("Checking certificate for %s: %t", r.Host, exists))
 
 	if exists {
 		h.logger.Debug(fmt.Sprintf("Certificate found for %s", r.Host))
