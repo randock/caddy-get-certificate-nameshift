@@ -154,7 +154,8 @@ func (hcg *NameshiftCertGetter) Provision(ctx caddy.Context) error {
 
 		files, err := os.ReadDir(hcg.LocalCache)
 		if err != nil {
-			log.Fatal(err)
+			hcg.logger.Error("Could not read local cache dir")
+			return nil
 		}
 
 		for _, file := range files {
@@ -233,9 +234,10 @@ func (hcg NameshiftCertGetter) fetchCertificate(name string) (*tls.Certificate, 
 	if err != nil {
 		return nil, err
 	}
+
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNoContent {
-		// endpoint is not managing certs for this handshake
+		// no certificate found right now
 		return nil, nil
 	}
 
