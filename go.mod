@@ -1,4 +1,4 @@
-module github.com/randock/nameshift-caddy-tls-redirect
+module github.com/randock/caddy-get-certificate-nameshift
 
 go 1.22.7
 
