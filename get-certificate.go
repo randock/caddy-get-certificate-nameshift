@@ -154,7 +154,8 @@ func (hcg *NameshiftCertGetter) Provision(ctx caddy.Context) error {
 
 		files, err := os.ReadDir(hcg.LocalCache)
 		if err != nil {
-			hcg.logger.Error("Could not read local cache dir")
+			os.MkdirAll(hcg.LocalCache, 0770)
+			hcg.logger.Error("Could not read local cache dir, creating...")
 			return nil
 		}
 
