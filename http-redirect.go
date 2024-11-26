@@ -9,7 +9,6 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-	"github.com/caddyserver/caddy/v2/modules/caddytls"
 	"go.uber.org/zap"
 )
 
@@ -22,7 +21,6 @@ func init() {
 
 type Middleware struct {
 	logger *zap.Logger
-	tlsApp *caddytls.TLS
 }
 
 func (Middleware) CaddyModule() caddy.ModuleInfo {
@@ -35,12 +33,6 @@ func (Middleware) CaddyModule() caddy.ModuleInfo {
 func (h *Middleware) Provision(ctx caddy.Context) error {
 	h.logger = ctx.Logger(h)
 
-	tlsAppIface, err := ctx.AppIfConfigured("tls")
-	if err != nil {
-		return fmt.Errorf("getting tls app: %v", err)
-	}
-
-	h.tlsApp = tlsAppIface.(*caddytls.TLS)
 	return nil
 }
 
@@ -65,14 +57,8 @@ func hostOnly(hostport string) string {
 
 func (h *Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 
-	// start managing this host, we need a cert for it
 	requestHost := hostOnly(r.Host)
-	err := h.tlsApp.Manage([]string{requestHost})
-	if err != nil {
-		h.logger.Error(err.Error())
-	}
-
-	exists := HasCertificate(requestHost) || len(caddytls.AllMatchingCertificates(requestHost)) > 0
+	exists := HasCertificate(requestHost)
 	h.logger.Debug(fmt.Sprintf("Checking certificate for %s: %t", r.Host, exists))
 
 	if exists {

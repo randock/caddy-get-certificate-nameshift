@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -21,6 +22,8 @@ import (
 	"github.com/caddyserver/certmagic"
 	"go.uber.org/zap"
 )
+
+var mutex sync.RWMutex = sync.RWMutex{}
 
 func tlsCertFromCertAndKeyPEMBundle(bundle []byte) (tls.Certificate, error) {
 	certBuilder, keyBuilder := new(bytes.Buffer), new(bytes.Buffer)
@@ -198,12 +201,18 @@ func (hcg NameshiftCertGetter) storeCertificateToDisk(id string, cert []byte) {
 }
 
 func HasCertificate(name string) bool {
+	mutex.RLock()
+	defer mutex.RUnlock()
+
 	_, ok := domainCertMap[name]
 
 	return ok
 }
 
 func (hcg NameshiftCertGetter) loadCertificateIntoMemoryCache(id string, cert tls.Certificate) {
+	mutex.Lock()
+	defer mutex.Unlock()
+
 	// store in cache
 	certificates[id] = cert
 
@@ -270,19 +279,27 @@ func (hcg NameshiftCertGetter) fetchCertificate(name string) (*tls.Certificate, 
 }
 
 func (hcg NameshiftCertGetter) GetCertificate(ctx context.Context, hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-
 	name := hello.ServerName
 
 	// check if we have the certificate cached
+	mutex.RLock()
 	certificateId, ok := domainCertMap[name]
+	mutex.RUnlock()
+
 	if ok {
 		hcg.logger.Debug(fmt.Sprintf("Cached certificate found for %s. Certificate id: %s", name, certificateId))
+
+		mutex.RLock()
 		cert := certificates[certificateId]
+		mutex.RUnlock()
 
 		// check if expired
 		if time.Now().After(cert.Leaf.NotAfter) {
 			hcg.logger.Debug(fmt.Sprintf("Cached certificate for %s was expired, removing. Certificate id: %s", name, certificateId))
+
+			mutex.Lock()
 			delete(certificates, certificateId)
+			mutex.Unlock()
 		} else {
 			// epxires soon
 			if time.Now().AddDate(0, 0, -5).After(cert.Leaf.NotAfter) {
