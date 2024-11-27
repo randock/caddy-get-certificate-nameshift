@@ -226,6 +226,11 @@ func (hcg NameshiftCertGetter) loadCertificateIntoMemoryCache(id string, cert tl
 func (hcg NameshiftCertGetter) fetchCertificate(name string) (*tls.Certificate, error) {
 	hcg.logger.Debug(fmt.Sprintf("Fetching certificate from API for %s.", name))
 
+	// ignore ips
+	if name == "168.220.85.117" || name == "2a09:8280:1::50:73de:0" {
+		return nil, fmt.Errorf("ignoring %s, it is an IP", name)
+	}
+
 	parsed, err := url.Parse(hcg.URL)
 	if err != nil {
 		return nil, err
