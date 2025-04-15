@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -273,7 +274,7 @@ func (hcg NameshiftCertGetter) fetchCertificate(name string) (*tls.Certificate, 
 	}
 
 	// ignore ips
-	if name == "168.220.85.117" || name == "2a09:8280:1::50:73de:0" {
+	if net.ParseIP(name) != nil {
 		return nil, fmt.Errorf("ignoring %s, it is an IP", name)
 	}
 
