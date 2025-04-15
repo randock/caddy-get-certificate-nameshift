@@ -108,6 +108,8 @@ type CertificateResponse struct {
 var (
 	domainCertMap map[string]string
 	certificates  map[string]*tls.Certificate
+	lastAccess    map[string]time.Time
+	cleanupTicker *time.Ticker
 )
 
 // NameshiftCertGetter can get a certificate via HTTP(S) request.
@@ -147,10 +149,29 @@ func (hcg *NameshiftCertGetter) Provision(ctx caddy.Context) error {
 	hcg.logger = ctx.Logger(hcg)
 	domainCertMap = make(map[string]string)
 	certificates = make(map[string]*tls.Certificate)
+	lastAccess = make(map[string]time.Time)
 
 	if hcg.URL == "" {
 		return fmt.Errorf("URL is required")
 	}
+
+	// Start cleanup goroutine
+	cleanupTicker = time.NewTicker(1 * time.Minute)
+	go func() {
+		for range cleanupTicker.C {
+			mutex.Lock()
+			now := time.Now()
+			// Only clear certificates that haven't been accessed in 5 minutes
+			for id, lastUsed := range lastAccess {
+				if now.Sub(lastUsed) > 5*time.Minute {
+					delete(certificates, id)
+					delete(lastAccess, id)
+					hcg.logger.Debug(fmt.Sprintf("Cleared unused certificate from memory cache: %s", id))
+				}
+			}
+			mutex.Unlock()
+		}
+	}()
 
 	if hcg.LocalCache != "" {
 		hcg.logger.Debug(fmt.Sprintf("Loading local certificates from cache: %s", hcg.LocalCache))
@@ -158,23 +179,19 @@ func (hcg *NameshiftCertGetter) Provision(ctx caddy.Context) error {
 		files, err := os.ReadDir(hcg.LocalCache)
 		if err != nil {
 			os.MkdirAll(hcg.LocalCache, 0770)
-			hcg.logger.Error("Could not read local cache dir, creating...")
+			hcg.logger.Warn("Could not read local cache dir, creating...")
 			return nil
 		}
 
+		// Only load domain mapping, not the actual certificates
 		for _, file := range files {
 			if !file.IsDir() {
-				// grab contents
-				hcg.logger.Debug(fmt.Sprintf("Loading certificate %s from disk", file.Name()))
-
 				fullname := filepath.Join(hcg.LocalCache, file.Name())
 				contents, err := os.ReadFile(fullname)
 				if err != nil {
 					log.Fatal(err)
 				}
 
-				// @TODO @mastercoding Order certificates by expiry date desc and don't
-				// override domainMap[cert] if it already has one
 				cert, err := tlsCertFromCertAndKeyPEMBundle(contents)
 				if err == nil {
 					if time.Now().After(cert.Leaf.NotAfter) {
@@ -183,7 +200,12 @@ func (hcg *NameshiftCertGetter) Provision(ctx caddy.Context) error {
 						continue
 					}
 
-					hcg.loadCertificateIntoMemoryCache(file.Name(), &cert)
+					// Only store the domain mapping, not the actual certificate
+					mutex.Lock()
+					for _, element := range cert.Leaf.DNSNames {
+						domainCertMap[element] = file.Name()
+					}
+					mutex.Unlock()
 				}
 			}
 		}
@@ -215,12 +237,32 @@ func (hcg NameshiftCertGetter) loadCertificateIntoMemoryCache(id string, cert *t
 
 	// store in cache
 	certificates[id] = cert
+	lastAccess[id] = time.Now()
 
 	hcg.logger.Debug(fmt.Sprintf("Storing certificate %s in cache. DNS Names: %s", id, cert.Leaf.DNSNames))
 
 	for _, element := range cert.Leaf.DNSNames {
 		domainCertMap[element] = id
 	}
+}
+
+func (hcg NameshiftCertGetter) loadCertificateFromDisk(id string) (*tls.Certificate, error) {
+	if hcg.LocalCache == "" {
+		return nil, fmt.Errorf("no local cache configured")
+	}
+
+	fullname := filepath.Join(hcg.LocalCache, id)
+	contents, err := os.ReadFile(fullname)
+	if err != nil {
+		return nil, err
+	}
+
+	cert, err := tlsCertFromCertAndKeyPEMBundle(contents)
+	if err != nil {
+		return nil, err
+	}
+
+	return &cert, nil
 }
 
 func (hcg NameshiftCertGetter) fetchCertificate(name string) (*tls.Certificate, error) {
@@ -294,26 +336,40 @@ func (hcg NameshiftCertGetter) GetCertificate(ctx context.Context, hello *tls.Cl
 	mutex.RUnlock()
 
 	if ok {
-		hcg.logger.Debug(fmt.Sprintf("Cached certificate found for %s. Certificate id: %s", hello.ServerName, certificateId))
+		hcg.logger.Debug(fmt.Sprintf("Found certificate mapping for %s. Certificate id: %s", hello.ServerName, certificateId))
 
+		// Try to get from memory cache first
 		mutex.RLock()
 		cert := certificates[certificateId]
 		mutex.RUnlock()
 
-		// check if expired
-		if time.Now().After(cert.Leaf.NotAfter) {
-			hcg.logger.Debug(fmt.Sprintf("Cached certificate for %s was expired, removing. Certificate id: %s", hello.ServerName, certificateId))
-
+		if cert != nil {
+			// Update last access time
 			mutex.Lock()
-			delete(certificates, certificateId)
+			lastAccess[certificateId] = time.Now()
 			mutex.Unlock()
-		} else {
-			// epxires soon
-			if time.Now().AddDate(0, 0, 5).After(cert.Leaf.NotAfter) {
-				hcg.logger.Debug(fmt.Sprintf("Cached certificate for %s is expiring soon (%s), fetching new one. Certificate id: %s", hello.ServerName, cert.Leaf.NotAfter, certificateId))
-				defer hcg.fetchCertificate(hello.ServerName)
-			}
 
+			// check if expired
+			if time.Now().After(cert.Leaf.NotAfter) {
+				hcg.logger.Debug(fmt.Sprintf("Cached certificate for %s was expired, removing. Certificate id: %s", hello.ServerName, certificateId))
+				mutex.Lock()
+				delete(certificates, certificateId)
+				delete(lastAccess, certificateId)
+				mutex.Unlock()
+			} else {
+				// expires soon
+				if time.Now().AddDate(0, 0, 5).After(cert.Leaf.NotAfter) {
+					hcg.logger.Debug(fmt.Sprintf("Cached certificate for %s is expiring soon (%s), fetching new one. Certificate id: %s", hello.ServerName, cert.Leaf.NotAfter, certificateId))
+					defer hcg.fetchCertificate(hello.ServerName)
+				}
+				return cert, nil
+			}
+		}
+
+		// If not in memory, try to load from disk
+		cert, err := hcg.loadCertificateFromDisk(certificateId)
+		if err == nil {
+			hcg.loadCertificateIntoMemoryCache(certificateId, cert)
 			return cert, nil
 		}
 	}
