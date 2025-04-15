@@ -1,0 +1,107 @@
+{
+	"logging": {
+		"logs": {
+			"default": {
+				"level": "debug"
+			}
+		}
+	},
+	"apps": {
+		"http": {
+			"servers": {
+				"srv0": {
+					"listen": [
+						":443"
+					],
+					"tls_connection_policies": [
+						{}
+					],
+					"automatic_https": {
+						"disable": true
+					}
+				},
+				"srv1": {
+					"listen": [
+						":80"
+					],
+					"routes": [
+						{
+							"group": "group3",
+							"match": [
+								{
+									"path": [
+										"/.well-known/acme-challenge/*"
+									]
+								}
+							],
+							"handle": [
+								{
+									"handler": "subroute",
+									"routes": [
+										{
+											"handle": [
+												{
+													"handler": "static_response",
+													"headers": {
+														"Location": [
+															"https://cert-manager.tunn.dev{http.request.uri}"
+														]
+													},
+													"status_code": 302
+												}
+											]
+										}
+									]
+								}
+							]
+						},
+						{
+							"group": "group3",
+							"handle": [
+								{
+									"handler": "subroute",
+									"routes": [
+										{
+											"handle": [
+												{
+													"handler": "redirect_if_cert_available"
+												},
+												{
+													"handler": "static_response",
+													"headers": {
+														"Location": [
+															"https://buy.nameshift.com/{http.request.host}{http.request.uri}"
+														]
+													},
+													"status_code": 302
+												}
+											]
+										}
+									]
+								}
+							]
+						}
+					],
+					"automatic_https": {
+						"disable": true
+					}
+				}
+			}
+		},
+		"tls": {
+			"automation": {
+				"policies": [
+					{
+						"get_certificate": [
+							{
+								"local_cache": "./cert_cache",
+								"url": "https://admin:j8Lm2KsxWGiZH9VipjFct69Z9y@cert-manager.nameshift.com/certificates/caddy",
+								"via": "nameshift"
+							}
+						]
+					}
+				]
+			}
+		}
+	}
+}

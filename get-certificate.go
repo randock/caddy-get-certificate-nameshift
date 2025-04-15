@@ -110,6 +110,7 @@ var (
 	domainCertMap map[string]string
 	certificates  map[string]*tls.Certificate
 	lastAccess    map[string]time.Time
+	hasCert       map[string]bool
 	cleanupTicker *time.Ticker
 )
 
@@ -151,6 +152,7 @@ func (hcg *NameshiftCertGetter) Provision(ctx caddy.Context) error {
 	domainCertMap = make(map[string]string)
 	certificates = make(map[string]*tls.Certificate)
 	lastAccess = make(map[string]time.Time)
+	hasCert = make(map[string]bool)
 
 	if hcg.URL == "" {
 		return fmt.Errorf("URL is required")
@@ -227,9 +229,7 @@ func HasCertificate(name string) bool {
 	mutex.RLock()
 	defer mutex.RUnlock()
 
-	_, ok := domainCertMap[name]
-
-	return ok
+	return hasCert[name]
 }
 
 func (hcg NameshiftCertGetter) loadCertificateIntoMemoryCache(id string, cert *tls.Certificate) {
@@ -242,8 +242,10 @@ func (hcg NameshiftCertGetter) loadCertificateIntoMemoryCache(id string, cert *t
 
 	hcg.logger.Debug(fmt.Sprintf("Storing certificate %s in cache. DNS Names: %s", id, cert.Leaf.DNSNames))
 
+	// Update domain mapping and hasCert
 	for _, element := range cert.Leaf.DNSNames {
 		domainCertMap[element] = id
+		hasCert[element] = true
 	}
 }
 
@@ -356,6 +358,12 @@ func (hcg NameshiftCertGetter) GetCertificate(ctx context.Context, hello *tls.Cl
 				mutex.Lock()
 				delete(certificates, certificateId)
 				delete(lastAccess, certificateId)
+
+				// Remove from hasCert map
+				for _, element := range cert.Leaf.DNSNames {
+					delete(hasCert, element)
+					delete(domainCertMap, element)
+				}
 				mutex.Unlock()
 			} else {
 				// expires soon
