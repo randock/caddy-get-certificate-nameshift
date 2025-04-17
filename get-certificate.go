@@ -22,9 +22,19 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/certmagic"
 	"go.uber.org/zap"
+	"golang.org/x/net/publicsuffix"
 )
 
-var mutex sync.RWMutex = sync.RWMutex{}
+var (
+	httpClient = &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        5,
+			MaxIdleConnsPerHost: 5,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
+)
 
 func tlsCertFromCertAndKeyPEMBundle(bundle []byte) (tls.Certificate, error) {
 	certBuilder, keyBuilder := new(bytes.Buffer), new(bytes.Buffer)
@@ -107,10 +117,18 @@ type CertificateResponse struct {
 }
 
 var (
-	domainCertMap map[string]string
-	certificates  map[string]*tls.Certificate
-	lastAccess    map[string]time.Time
-	hasCert       map[string]bool
+	domainCertMapMutex sync.RWMutex
+	domainCertMap      map[string]string
+
+	certificatesMutex sync.RWMutex
+	certificates      map[string]*tls.Certificate
+
+	lastAccessMutex sync.RWMutex
+	lastAccess      map[string]time.Time
+
+	hasCertMutex sync.RWMutex
+	hasCert      map[string]bool
+
 	cleanupTicker *time.Ticker
 )
 
@@ -162,7 +180,8 @@ func (hcg *NameshiftCertGetter) Provision(ctx caddy.Context) error {
 	cleanupTicker = time.NewTicker(1 * time.Minute)
 	go func() {
 		for range cleanupTicker.C {
-			mutex.Lock()
+			certificatesMutex.Lock()
+			lastAccessMutex.Lock()
 			now := time.Now()
 			// Only clear certificates that haven't been accessed in 5 minutes
 			for id, lastUsed := range lastAccess {
@@ -172,7 +191,8 @@ func (hcg *NameshiftCertGetter) Provision(ctx caddy.Context) error {
 					hcg.logger.Debug(fmt.Sprintf("Cleared unused certificate from memory cache: %s", id))
 				}
 			}
-			mutex.Unlock()
+			lastAccessMutex.Unlock()
+			certificatesMutex.Unlock()
 		}
 	}()
 
@@ -204,11 +224,11 @@ func (hcg *NameshiftCertGetter) Provision(ctx caddy.Context) error {
 					}
 
 					// Only store the domain mapping, not the actual certificate
-					mutex.Lock()
+					domainCertMapMutex.Lock()
 					for _, element := range cert.Leaf.DNSNames {
 						domainCertMap[element] = file.Name()
 					}
-					mutex.Unlock()
+					domainCertMapMutex.Unlock()
 				}
 			}
 		}
@@ -226,15 +246,21 @@ func (hcg NameshiftCertGetter) storeCertificateToDisk(id string, cert *[]byte) {
 }
 
 func HasCertificate(name string) bool {
-	mutex.RLock()
-	defer mutex.RUnlock()
+	hasCertMutex.RLock()
+	defer hasCertMutex.RUnlock()
 
 	return hasCert[name]
 }
 
 func (hcg NameshiftCertGetter) loadCertificateIntoMemoryCache(id string, cert *tls.Certificate) {
-	mutex.Lock()
-	defer mutex.Unlock()
+	certificatesMutex.Lock()
+	lastAccessMutex.Lock()
+	domainCertMapMutex.Lock()
+	hasCertMutex.Lock()
+	defer certificatesMutex.Unlock()
+	defer lastAccessMutex.Unlock()
+	defer domainCertMapMutex.Unlock()
+	defer hasCertMutex.Unlock()
 
 	// store in cache
 	certificates[id] = cert
@@ -269,7 +295,7 @@ func (hcg NameshiftCertGetter) loadCertificateFromDisk(id string) (*tls.Certific
 }
 
 func (hcg NameshiftCertGetter) fetchCertificate(name string) (*tls.Certificate, error) {
-	hcg.logger.Debug(fmt.Sprintf("Fetching certificate from API for %s.", name))
+	hcg.logger.Debug(fmt.Sprintf("Fetching certificate for %s.", name))
 
 	if name == "" {
 		return nil, fmt.Errorf("ignoring empty name")
@@ -285,28 +311,69 @@ func (hcg NameshiftCertGetter) fetchCertificate(name string) (*tls.Certificate, 
 		return nil, err
 	}
 
-	qs := parsed.Query()
-	qs.Set("server_name", name)
-	parsed.RawQuery = qs.Encode()
+	// parse domain into parts
+	root, err := publicsuffix.EffectiveTLDPlusOne(strings.TrimRight(name, "."))
+	if err != nil {
+		return nil, err
+	}
 
+	// is apex
+	apex := root == name
+	firstTwoCharacters := root[:2]
+
+	// combine path to fetch certificate from
+	path := fmt.Sprintf("/%s/%s/%s.json",
+		map[bool]string{true: "apex", false: "www"}[apex],
+		firstTwoCharacters,
+		name)
+
+	// try to fetch certificate directly from cache
+	parsed.Path = path
+
+	hcg.logger.Debug(fmt.Sprintf("Trying cdn cache url: %s", parsed.String()))
 	req, err := http.NewRequestWithContext(hcg.ctx, http.MethodGet, parsed.String(), nil)
 	if err != nil {
 		return nil, err
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to fetch from CDN: %v", err)
+	}
+
+	// Handle CDN response
+	if resp.StatusCode == http.StatusNotFound {
+		resp.Body.Close()
+
+		// try to fetch from API
+		hcg.logger.Debug("Certificate not found in CDN, forcing fetch from origin API")
+
+		parsed.Path = "/certificates/caddy"
+		qs := parsed.Query()
+		qs.Set("server_name", name)
+		parsed.RawQuery = qs.Encode()
+
+		hcg.logger.Debug(fmt.Sprintf("Fetching certificate from origin API: %s", parsed.String()))
+
+		req, err = http.NewRequestWithContext(hcg.ctx, http.MethodGet, parsed.String(), nil)
+		if err != nil {
+			return nil, err
+		}
+
+		resp, err = httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch from API: %v", err)
+		}
 	}
 
 	defer resp.Body.Close()
+
 	if resp.StatusCode == http.StatusNoContent {
-		// no certificate found right now
 		return nil, nil
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("got HTTP %d", resp.StatusCode)
+		return nil, fmt.Errorf("got HTTP %d for url %s", resp.StatusCode, resp.Request.URL.String())
 	}
 
 	bodyBytes, err := io.ReadAll(resp.Body)
@@ -315,47 +382,54 @@ func (hcg NameshiftCertGetter) fetchCertificate(name string) (*tls.Certificate, 
 	}
 
 	var result CertificateResponse
-	if err := json.Unmarshal(bodyBytes, &result); err != nil { // Parse []byte to go struct pointer
-		fmt.Println("Can not unmarshal JSON")
+	if err := json.Unmarshal(bodyBytes, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal JSON response: %v", err)
 	}
 
-	pem := []byte(result.Certificate)
+	if result.Certificate == "" {
+		return nil, fmt.Errorf("empty certificate in response")
+	}
 
-	cert, err := tlsCertFromCertAndKeyPEMBundle(pem)
+	cert, err := tlsCertFromCertAndKeyPEMBundle([]byte(result.Certificate))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to parse certificate: %v", err)
 	}
 
+	certBytes := []byte(result.Certificate)
 	hcg.loadCertificateIntoMemoryCache(result.Id, &cert)
-	hcg.storeCertificateToDisk(result.Id, &pem)
+	hcg.storeCertificateToDisk(result.Id, &certBytes)
 
 	return &cert, nil
 }
 
 func (hcg NameshiftCertGetter) GetCertificate(ctx context.Context, hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	// check if we have the certificate cached
-	mutex.RLock()
+	domainCertMapMutex.RLock()
 	certificateId, ok := domainCertMap[hello.ServerName]
-	mutex.RUnlock()
+	domainCertMapMutex.RUnlock()
 
 	if ok {
 		hcg.logger.Debug(fmt.Sprintf("Found certificate mapping for %s. Certificate id: %s", hello.ServerName, certificateId))
 
 		// Try to get from memory cache first
-		mutex.RLock()
+		certificatesMutex.RLock()
 		cert := certificates[certificateId]
-		mutex.RUnlock()
+		certificatesMutex.RUnlock()
 
 		if cert != nil {
 			// Update last access time
-			mutex.Lock()
+			lastAccessMutex.Lock()
 			lastAccess[certificateId] = time.Now()
-			mutex.Unlock()
+			lastAccessMutex.Unlock()
 
 			// check if expired
 			if time.Now().After(cert.Leaf.NotAfter) {
 				hcg.logger.Debug(fmt.Sprintf("Cached certificate for %s was expired, removing. Certificate id: %s", hello.ServerName, certificateId))
-				mutex.Lock()
+				certificatesMutex.Lock()
+				lastAccessMutex.Lock()
+				hasCertMutex.Lock()
+				domainCertMapMutex.Lock()
+
 				delete(certificates, certificateId)
 				delete(lastAccess, certificateId)
 
@@ -364,7 +438,11 @@ func (hcg NameshiftCertGetter) GetCertificate(ctx context.Context, hello *tls.Cl
 					delete(hasCert, element)
 					delete(domainCertMap, element)
 				}
-				mutex.Unlock()
+
+				certificatesMutex.Unlock()
+				lastAccessMutex.Unlock()
+				hasCertMutex.Unlock()
+				domainCertMapMutex.Unlock()
 			} else {
 				// expires soon
 				if time.Now().AddDate(0, 0, 5).After(cert.Leaf.NotAfter) {
