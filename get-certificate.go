@@ -323,6 +323,9 @@ func (hcg NameshiftCertGetter) parseCertificateResponse(resp *http.Response) (*t
 		return &cert, nil
 	}
 
+	// we got an expired cert
+	hcg.logger.Debug(fmt.Sprintf("Got an expired cert: %s", result.Id))
+
 	return nil, fmt.Errorf("certificate is expired")
 }
 
@@ -376,7 +379,7 @@ func (hcg NameshiftCertGetter) fetchCertificate(name string) (*tls.Certificate, 
 	if resp.StatusCode == http.StatusOK {
 		cert, err := hcg.parseCertificateResponse(resp)
 		if err == nil && cert != nil {
-			resp.Body.Close()
+			defer resp.Body.Close()
 
 			return cert, nil
 		}
@@ -408,12 +411,12 @@ func (hcg NameshiftCertGetter) fetchCertificate(name string) (*tls.Certificate, 
 	if resp.StatusCode == http.StatusOK {
 		cert, err := hcg.parseCertificateResponse(resp)
 		if err == nil && cert != nil {
-			resp.Body.Close()
+			defer resp.Body.Close()
 			return cert, nil
 		}
 	}
 
-	resp.Body.Close()
+	defer resp.Body.Close()
 
 	return nil, fmt.Errorf("failed to fetch certificate from API")
 }
@@ -431,6 +434,17 @@ func (hcg NameshiftCertGetter) GetCertificate(ctx context.Context, hello *tls.Cl
 		certificatesMutex.RLock()
 		cert := certificates[certificateId]
 		certificatesMutex.RUnlock()
+
+		if cert == nil {
+			// not found in memory, try to load from disk
+			hcg.logger.Debug(fmt.Sprintf("Certificate not found in memory, loading from disk: %s", certificateId))
+
+			var err error
+			cert, err = hcg.loadCertificateFromDisk(certificateId)
+			if err == nil {
+				hcg.loadCertificateIntoMemoryCache(certificateId, cert)
+			}
+		}
 
 		if cert != nil {
 			// Update last access time
@@ -463,17 +477,11 @@ func (hcg NameshiftCertGetter) GetCertificate(ctx context.Context, hello *tls.Cl
 				// expires soon
 				if time.Now().AddDate(0, 0, 5).After(cert.Leaf.NotAfter) {
 					hcg.logger.Debug(fmt.Sprintf("Cached certificate for %s is expiring soon (%s), fetching new one. Certificate id: %s", hello.ServerName, cert.Leaf.NotAfter, certificateId))
-					defer hcg.fetchCertificate(hello.ServerName)
+					go hcg.fetchCertificate(hello.ServerName)
 				}
+
 				return cert, nil
 			}
-		}
-
-		// If not in memory, try to load from disk
-		cert, err := hcg.loadCertificateFromDisk(certificateId)
-		if err == nil {
-			hcg.loadCertificateIntoMemoryCache(certificateId, cert)
-			return cert, nil
 		}
 	}
 
