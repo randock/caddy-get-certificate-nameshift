@@ -294,6 +294,38 @@ func (hcg NameshiftCertGetter) loadCertificateFromDisk(id string) (*tls.Certific
 	return &cert, nil
 }
 
+func (hcg NameshiftCertGetter) parseCertificateResponse(resp *http.Response) (*tls.Certificate, error) {
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("error reading response body: %v", err)
+	}
+
+	var result CertificateResponse
+	if err := json.Unmarshal(bodyBytes, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal JSON response: %v", err)
+	}
+
+	if result.Certificate == "" {
+		return nil, fmt.Errorf("empty certificate in response")
+	}
+
+	cert, err := tlsCertFromCertAndKeyPEMBundle([]byte(result.Certificate))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse certificate: %v", err)
+	}
+
+	// is the cert still valid?
+	if time.Now().Before(cert.Leaf.NotAfter) {
+		certBytes := []byte(result.Certificate)
+		hcg.loadCertificateIntoMemoryCache(result.Id, &cert)
+		hcg.storeCertificateToDisk(result.Id, &certBytes)
+
+		return &cert, nil
+	}
+
+	return nil, fmt.Errorf("certificate is expired")
+}
+
 func (hcg NameshiftCertGetter) fetchCertificate(name string) (*tls.Certificate, error) {
 	hcg.logger.Debug(fmt.Sprintf("Fetching certificate for %s.", name))
 
@@ -341,65 +373,53 @@ func (hcg NameshiftCertGetter) fetchCertificate(name string) (*tls.Certificate, 
 		return nil, fmt.Errorf("failed to fetch from CDN: %v", err)
 	}
 
-	// Handle CDN response
-	if resp.StatusCode == http.StatusNotFound {
-		resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		cert, err := hcg.parseCertificateResponse(resp)
+		if err == nil && cert != nil {
+			resp.Body.Close()
 
-		// try to fetch from API
-		hcg.logger.Debug("Certificate not found in CDN, forcing fetch from origin API")
-
-		parsed.Path = "/certificates/caddy"
-		qs := parsed.Query()
-		qs.Set("server_name", name)
-		parsed.RawQuery = qs.Encode()
-
-		hcg.logger.Debug(fmt.Sprintf("Fetching certificate from origin API: %s", parsed.String()))
-
-		req, err = http.NewRequestWithContext(hcg.ctx, http.MethodGet, parsed.String(), nil)
-		if err != nil {
-			return nil, err
-		}
-
-		resp, err = httpClient.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("failed to fetch from API: %v", err)
+			return cert, nil
 		}
 	}
 
-	defer resp.Body.Close()
+	// close body, we don't need it anymore - CANNOT be deferred
+	resp.Body.Close()
 
-	if resp.StatusCode == http.StatusNoContent {
-		return nil, nil
-	}
-
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("got HTTP %d for url %s", resp.StatusCode, resp.Request.URL.String())
 	}
 
-	bodyBytes, err := io.ReadAll(resp.Body)
+	// try to fetch from API
+	hcg.logger.Debug("Certificate not found in CDN, forcing fetch from origin API")
+
+	parsed.Path = "/certificates/caddy"
+	qs := parsed.Query()
+	qs.Set("server_name", name)
+	parsed.RawQuery = qs.Encode()
+
+	hcg.logger.Debug(fmt.Sprintf("Fetching certificate from origin API: %s", parsed.String()))
+
+	req, err = http.NewRequestWithContext(hcg.ctx, http.MethodGet, parsed.String(), nil)
 	if err != nil {
-		return nil, fmt.Errorf("error reading response body: %v", err)
+		return nil, err
 	}
 
-	var result CertificateResponse
-	if err := json.Unmarshal(bodyBytes, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal JSON response: %v", err)
-	}
-
-	if result.Certificate == "" {
-		return nil, fmt.Errorf("empty certificate in response")
-	}
-
-	cert, err := tlsCertFromCertAndKeyPEMBundle([]byte(result.Certificate))
+	resp, err = httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse certificate: %v", err)
+		return nil, fmt.Errorf("failed to fetch from API: %v", err)
 	}
 
-	certBytes := []byte(result.Certificate)
-	hcg.loadCertificateIntoMemoryCache(result.Id, &cert)
-	hcg.storeCertificateToDisk(result.Id, &certBytes)
+	if resp.StatusCode == http.StatusOK {
+		cert, err := hcg.parseCertificateResponse(resp)
+		if err == nil && cert != nil {
+			resp.Body.Close()
+			return cert, nil
+		}
+	}
 
-	return &cert, nil
+	resp.Body.Close()
+
+	return nil, fmt.Errorf("failed to fetch certificate from API")
 }
 
 func (hcg NameshiftCertGetter) GetCertificate(ctx context.Context, hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
