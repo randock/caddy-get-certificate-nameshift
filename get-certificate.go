@@ -385,10 +385,6 @@ func (hcg NameshiftCertGetter) fetchCertificate(name string) (*tls.Certificate, 
 	// close body, we don't need it anymore - CANNOT be deferred
 	resp.Body.Close()
 
-	if resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("got HTTP %d for url %s", resp.StatusCode, resp.Request.URL.String())
-	}
-
 	// try to fetch from API
 	hcg.logger.Debug("Certificate not found in CDN, forcing fetch from origin API")
 
