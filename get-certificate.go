@@ -22,7 +22,6 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/certmagic"
 	"go.uber.org/zap"
-	"golang.org/x/net/publicsuffix"
 )
 
 var (
@@ -266,7 +265,7 @@ func (hcg NameshiftCertGetter) loadCertificateIntoMemoryCache(id string, cert *t
 	certificates[id] = cert
 	lastAccess[id] = time.Now()
 
-	hcg.logger.Debug(fmt.Sprintf("Storing certificate %s in cache. DNS Names: %s", id, cert.Leaf.DNSNames))
+	hcg.logger.Debug(fmt.Sprintf("Storing certificate %s in cache. DNS Names: %s. Expires at: %s", id, cert.Leaf.DNSNames, cert.Leaf.NotAfter))
 
 	// Update domain mapping and hasCert
 	for _, element := range cert.Leaf.DNSNames {
@@ -346,50 +345,8 @@ func (hcg NameshiftCertGetter) fetchCertificate(name string) (*tls.Certificate, 
 		return nil, err
 	}
 
-	// parse domain into parts
-	root, err := publicsuffix.EffectiveTLDPlusOne(strings.TrimRight(name, "."))
-	if err != nil {
-		return nil, err
-	}
-
-	// is apex
-	apex := root == name
-	firstTwoCharacters := root[:2]
-
-	// combine path to fetch certificate from
-	path := fmt.Sprintf("/%s/%s/%s.json",
-		map[bool]string{true: "apex", false: "www"}[apex],
-		firstTwoCharacters,
-		name)
-
-	// try to fetch certificate directly from cache
-	parsed.Path = path
-
-	hcg.logger.Debug(fmt.Sprintf("Trying cdn cache url: %s", parsed.String()))
-	req, err := http.NewRequestWithContext(hcg.ctx, http.MethodGet, parsed.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch from CDN: %v", err)
-	}
-
-	if resp.StatusCode == http.StatusOK {
-		cert, err := hcg.parseCertificateResponse(resp)
-		if err == nil && cert != nil {
-			defer resp.Body.Close()
-
-			return cert, nil
-		}
-	}
-
-	// close body, we don't need it anymore - CANNOT be deferred
-	resp.Body.Close()
-
 	// try to fetch from API
-	hcg.logger.Debug("Certificate not found in CDN, forcing fetch from origin API")
+	hcg.logger.Debug("Fetching certificate from API")
 
 	parsed.Path = "/certificates/caddy"
 	qs := parsed.Query()
@@ -398,12 +355,12 @@ func (hcg NameshiftCertGetter) fetchCertificate(name string) (*tls.Certificate, 
 
 	hcg.logger.Debug(fmt.Sprintf("Fetching certificate from origin API: %s", parsed.String()))
 
-	req, err = http.NewRequestWithContext(hcg.ctx, http.MethodGet, parsed.String(), nil)
+	req, err := http.NewRequestWithContext(hcg.ctx, http.MethodGet, parsed.String(), nil)
 	if err != nil {
 		return nil, err
 	}
 
-	resp, err = httpClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch from API: %v", err)
 	}
