@@ -196,7 +196,7 @@ func (hcg *NameshiftCertGetter) Provision(ctx caddy.Context) error {
 	}()
 
 	if hcg.LocalCache != "" {
-		hcg.logger.Debug(fmt.Sprintf("Loading local certificates from cache: %s", hcg.LocalCache))
+		hcg.logger.Debug("loading local certificates from cache", zap.String("path", hcg.LocalCache))
 
 		files, err := os.ReadDir(hcg.LocalCache)
 		if err != nil {
@@ -217,7 +217,10 @@ func (hcg *NameshiftCertGetter) Provision(ctx caddy.Context) error {
 				cert, err := tlsCertFromCertAndKeyPEMBundle(contents)
 				if err == nil {
 					if time.Now().After(cert.Leaf.NotAfter) {
-						hcg.logger.Debug(fmt.Sprintf("Certificate %s expired: %s", file.Name(), cert.Leaf.NotAfter))
+						hcg.logger.Debug("cached certificate expired",
+							zap.String("certificate_id", file.Name()),
+							zap.Time("expired_at", cert.Leaf.NotAfter),
+						)
 						os.Remove(fullname)
 						continue
 					}
@@ -265,7 +268,11 @@ func (hcg NameshiftCertGetter) loadCertificateIntoMemoryCache(id string, cert *t
 	certificates[id] = cert
 	lastAccess[id] = time.Now()
 
-	hcg.logger.Debug(fmt.Sprintf("Storing certificate %s in cache. DNS Names: %s. Expires at: %s", id, cert.Leaf.DNSNames, cert.Leaf.NotAfter))
+	hcg.logger.Debug("storing certificate in memory cache",
+		zap.String("certificate_id", id),
+		zap.Strings("dns_names", cert.Leaf.DNSNames),
+		zap.Time("expires_at", cert.Leaf.NotAfter),
+	)
 
 	// Update domain mapping and hasCert
 	for _, element := range cert.Leaf.DNSNames {
@@ -323,13 +330,13 @@ func (hcg NameshiftCertGetter) parseCertificateResponse(resp *http.Response) (*t
 	}
 
 	// we got an expired cert
-	hcg.logger.Debug(fmt.Sprintf("Got an expired cert: %s", result.Id))
+	hcg.logger.Debug("received expired certificate", zap.String("certificate_id", result.Id))
 
 	return nil, fmt.Errorf("certificate is expired")
 }
 
 func (hcg NameshiftCertGetter) fetchCertificate(name string) (*tls.Certificate, error) {
-	hcg.logger.Debug(fmt.Sprintf("Fetching certificate for %s.", name))
+	hcg.logger.Debug("fetching certificate", zap.String("server_name", name))
 
 	if name == "" {
 		return nil, fmt.Errorf("ignoring empty name")
@@ -353,7 +360,7 @@ func (hcg NameshiftCertGetter) fetchCertificate(name string) (*tls.Certificate, 
 	qs.Set("server_name", name)
 	parsed.RawQuery = qs.Encode()
 
-	hcg.logger.Debug(fmt.Sprintf("Fetching certificate from origin API: %s", parsed.String()))
+	hcg.logger.Debug("fetching certificate from origin API", zap.String("server_name", name))
 
 	req, err := http.NewRequestWithContext(hcg.ctx, http.MethodGet, parsed.String(), nil)
 	if err != nil {
@@ -385,7 +392,10 @@ func (hcg NameshiftCertGetter) GetCertificate(ctx context.Context, hello *tls.Cl
 	domainCertMapMutex.RUnlock()
 
 	if ok {
-		hcg.logger.Debug(fmt.Sprintf("Found certificate mapping for %s. Certificate id: %s", hello.ServerName, certificateId))
+		hcg.logger.Debug("found certificate mapping",
+			zap.String("server_name", hello.ServerName),
+			zap.String("certificate_id", certificateId),
+		)
 
 		// Try to get from memory cache first
 		certificatesMutex.RLock()
@@ -394,7 +404,7 @@ func (hcg NameshiftCertGetter) GetCertificate(ctx context.Context, hello *tls.Cl
 
 		if cert == nil {
 			// not found in memory, try to load from disk
-			hcg.logger.Debug(fmt.Sprintf("Certificate not found in memory, loading from disk: %s", certificateId))
+			hcg.logger.Debug("certificate not found in memory; loading from disk", zap.String("certificate_id", certificateId))
 
 			var err error
 			cert, err = hcg.loadCertificateFromDisk(certificateId)
@@ -411,7 +421,10 @@ func (hcg NameshiftCertGetter) GetCertificate(ctx context.Context, hello *tls.Cl
 
 			// check if expired
 			if time.Now().After(cert.Leaf.NotAfter) {
-				hcg.logger.Debug(fmt.Sprintf("Cached certificate for %s was expired, removing. Certificate id: %s", hello.ServerName, certificateId))
+				hcg.logger.Debug("cached certificate expired; removing",
+					zap.String("server_name", hello.ServerName),
+					zap.String("certificate_id", certificateId),
+				)
 				certificatesMutex.Lock()
 				lastAccessMutex.Lock()
 				hasCertMutex.Lock()
@@ -433,7 +446,11 @@ func (hcg NameshiftCertGetter) GetCertificate(ctx context.Context, hello *tls.Cl
 			} else {
 				// expires soon
 				if time.Now().AddDate(0, 0, 5).After(cert.Leaf.NotAfter) {
-					hcg.logger.Debug(fmt.Sprintf("Cached certificate for %s is expiring soon (%s), fetching new one. Certificate id: %s", hello.ServerName, cert.Leaf.NotAfter, certificateId))
+					hcg.logger.Debug("cached certificate is expiring soon; refreshing",
+						zap.String("server_name", hello.ServerName),
+						zap.String("certificate_id", certificateId),
+						zap.Time("expires_at", cert.Leaf.NotAfter),
+					)
 					go hcg.fetchCertificate(hello.ServerName)
 				}
 

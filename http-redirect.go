@@ -1,7 +1,6 @@
 package nameshift
 
 import (
-	"fmt"
 	"net"
 	"net/http"
 
@@ -59,10 +58,13 @@ func (h *Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 
 	requestHost := hostOnly(r.Host)
 	exists := HasCertificate(requestHost)
-	h.logger.Debug(fmt.Sprintf("Checking certificate for %s: %t", r.Host, exists))
+	h.logger.Debug("checking certificate availability",
+		zap.String("host", r.Host),
+		zap.Bool("available", exists),
+	)
 
 	if exists {
-		h.logger.Debug(fmt.Sprintf("Certificate found for %s", r.Host))
+		h.logger.Debug("certificate found", zap.String("host", r.Host))
 
 		toURL := "https://"
 
@@ -77,7 +79,7 @@ func (h *Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 
 		http.Redirect(w, r, toURL, http.StatusMovedPermanently)
 	} else {
-		h.logger.Debug(fmt.Sprintf("No certificate found for %s", r.Host))
+		h.logger.Debug("certificate not found", zap.String("host", r.Host))
 		return next.ServeHTTP(w, r)
 	}
 
