@@ -22,14 +22,15 @@ import (
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/certmagic"
+	"github.com/dustin/go-humanize"
 	"go.uber.org/zap"
 	"golang.org/x/sync/singleflight"
 )
 
 const (
-	maxCertificateCacheBytes int64 = 2 << 30
-	negativeCacheTTL               = 30 * time.Second
-	persistenceQueueSize           = 64
+	defaultMaxCertificateCacheBytes int64 = 256 << 20
+	negativeCacheTTL                      = 30 * time.Second
+	persistenceQueueSize                  = 64
 )
 
 var (
@@ -242,6 +243,9 @@ type NameshiftCertGetter struct {
 	// capable of providing a certificate but was unable to.
 	URL        string `json:"url,omitempty"`
 	LocalCache string `json:"local_cache,omitempty"`
+	// MaxCacheSize is the maximum serialized size of certificates retained in memory.
+	// A zero value uses the default of 256 MiB.
+	MaxCacheSize int64 `json:"max_cache_size,omitempty"`
 
 	logger *zap.Logger
 	ctx    context.Context
@@ -267,10 +271,28 @@ func (hcg *NameshiftCertGetter) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
+func (hcg *NameshiftCertGetter) cacheSizeLimit() (int64, error) {
+	if hcg.MaxCacheSize < 0 {
+		return 0, fmt.Errorf("max_cache_size must be greater than zero")
+	}
+	if hcg.MaxCacheSize == 0 {
+		return defaultMaxCertificateCacheBytes, nil
+	}
+	return hcg.MaxCacheSize, nil
+}
+
 func (hcg *NameshiftCertGetter) Provision(ctx caddy.Context) error {
 	hcg.ctx = ctx
 	hcg.logger = ctx.Logger(hcg)
-	hcg.cache = newCertificateLRU(maxCertificateCacheBytes)
+	maxCacheSize, err := hcg.cacheSizeLimit()
+	if err != nil {
+		return err
+	}
+	hcg.cache = newCertificateLRU(maxCacheSize)
+	hcg.logger.Info("configured certificate memory cache",
+		zap.String("max_size", humanize.IBytes(uint64(maxCacheSize))),
+		zap.Int64("max_size_bytes", maxCacheSize),
+	)
 	hcg.negativeCache = make(map[string]time.Time)
 	hcg.renewals = make(map[string]bool)
 
@@ -664,6 +686,19 @@ func (hcg *NameshiftCertGetter) UnmarshalCaddyfile(d *caddyfile.Dispenser) error
 				return d.ArgErr()
 			}
 			hcg.URL = d.Val()
+		case "max_cache_size":
+			var size string
+			if !d.AllArgs(&size) {
+				return d.ArgErr()
+			}
+			bytes, err := humanize.ParseBytes(size)
+			if err != nil {
+				return d.Errf("parsing max_cache_size: %v", err)
+			}
+			if bytes == 0 || bytes > uint64(1<<63-1) {
+				return d.Errf("max_cache_size must be between 1 byte and %d bytes", int64(1<<63-1))
+			}
+			hcg.MaxCacheSize = int64(bytes)
 		default:
 			return d.Errf("unrecognized subdirective %q", d.Val())
 		}

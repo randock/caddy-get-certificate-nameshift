@@ -19,8 +19,46 @@ import (
 	"testing"
 	"time"
 
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"go.uber.org/zap"
 )
+
+func TestCertificateCacheSizeDefaultsTo256MiB(t *testing.T) {
+	getter := &NameshiftCertGetter{}
+
+	size, err := getter.cacheSizeLimit()
+	if err != nil {
+		t.Fatalf("getting default cache size: %v", err)
+	}
+	if size != 256<<20 {
+		t.Fatalf("expected 256 MiB default cache, got %d bytes", size)
+	}
+}
+
+func TestUnmarshalCaddyfileCertificateCacheSize(t *testing.T) {
+	dispenser := caddyfile.NewTestDispenser(`nameshift https://certificates.example {
+		max_cache_size 2GB
+	}`)
+	getter := &NameshiftCertGetter{}
+
+	if err := getter.UnmarshalCaddyfile(dispenser); err != nil {
+		t.Fatalf("unmarshalling Caddyfile: %v", err)
+	}
+	if getter.MaxCacheSize != 2_000_000_000 {
+		t.Fatalf("expected 2 GB cache, got %d bytes", getter.MaxCacheSize)
+	}
+}
+
+func TestUnmarshalCaddyfileRejectsInvalidCacheSize(t *testing.T) {
+	dispenser := caddyfile.NewTestDispenser(`nameshift https://certificates.example {
+		max_cache_size enormous
+	}`)
+	getter := &NameshiftCertGetter{}
+
+	if err := getter.UnmarshalCaddyfile(dispenser); err == nil {
+		t.Fatal("expected invalid max_cache_size to fail")
+	}
+}
 
 func TestCertificateLRUEvictsLeastRecentlyUsed(t *testing.T) {
 	cache := newCertificateLRU(3)
@@ -164,7 +202,7 @@ func newTestCertificateGetter(apiURL string) *NameshiftCertGetter {
 		URL:           apiURL,
 		logger:        zap.NewNop(),
 		ctx:           context.Background(),
-		cache:         newCertificateLRU(maxCertificateCacheBytes),
+		cache:         newCertificateLRU(defaultMaxCertificateCacheBytes),
 		negativeCache: make(map[string]time.Time),
 		renewals:      make(map[string]bool),
 	}
