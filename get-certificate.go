@@ -2,13 +2,14 @@ package nameshift
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -22,6 +23,13 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/certmagic"
 	"go.uber.org/zap"
+	"golang.org/x/sync/singleflight"
+)
+
+const (
+	maxCertificateCacheBytes int64 = 2 << 30
+	negativeCacheTTL               = 30 * time.Second
+	persistenceQueueSize           = 64
 )
 
 var (
@@ -34,6 +42,94 @@ var (
 		},
 	}
 )
+
+type certificateCacheEntry struct {
+	id      string
+	cert    *tls.Certificate
+	size    int64
+	element *list.Element
+}
+
+type certificateLRU struct {
+	mutex    sync.Mutex
+	entries  map[string]*certificateCacheEntry
+	recency  *list.List
+	maxBytes int64
+	bytes    int64
+}
+
+func newCertificateLRU(maxBytes int64) *certificateLRU {
+	return &certificateLRU{
+		entries:  make(map[string]*certificateCacheEntry),
+		recency:  list.New(),
+		maxBytes: maxBytes,
+	}
+}
+
+func (cache *certificateLRU) Get(id string) (*tls.Certificate, bool) {
+	cache.mutex.Lock()
+	defer cache.mutex.Unlock()
+
+	entry, ok := cache.entries[id]
+	if !ok {
+		return nil, false
+	}
+
+	cache.recency.MoveToFront(entry.element)
+	return entry.cert, true
+}
+
+func (cache *certificateLRU) Add(id string, cert *tls.Certificate, size int64) {
+	if cert == nil || size <= 0 || size > cache.maxBytes {
+		return
+	}
+
+	cache.mutex.Lock()
+	defer cache.mutex.Unlock()
+
+	if existing, ok := cache.entries[id]; ok {
+		cache.bytes -= existing.size
+		existing.cert = cert
+		existing.size = size
+		cache.bytes += size
+		cache.recency.MoveToFront(existing.element)
+	} else {
+		entry := &certificateCacheEntry{id: id, cert: cert, size: size}
+		entry.element = cache.recency.PushFront(entry)
+		cache.entries[id] = entry
+		cache.bytes += size
+	}
+
+	for cache.bytes > cache.maxBytes {
+		oldestElement := cache.recency.Back()
+		if oldestElement == nil {
+			break
+		}
+		oldest := oldestElement.Value.(*certificateCacheEntry)
+		delete(cache.entries, oldest.id)
+		cache.recency.Remove(oldestElement)
+		cache.bytes -= oldest.size
+	}
+}
+
+func (cache *certificateLRU) Delete(id string) {
+	cache.mutex.Lock()
+	defer cache.mutex.Unlock()
+
+	entry, ok := cache.entries[id]
+	if !ok {
+		return
+	}
+
+	delete(cache.entries, id)
+	cache.recency.Remove(entry.element)
+	cache.bytes -= entry.size
+}
+
+type certificatePersistence struct {
+	id   string
+	data []byte
+}
 
 func tlsCertFromCertAndKeyPEMBundle(bundle []byte) (tls.Certificate, error) {
 	certBuilder, keyBuilder := new(bytes.Buffer), new(bytes.Buffer)
@@ -102,12 +198,16 @@ func tlsCertFromCertAndKeyPEMBundle(bundle []byte) (tls.Certificate, error) {
 	if err != nil {
 		return tls.Certificate{}, fmt.Errorf("making X509 key pair: %v", err)
 	}
+	cert.Leaf, err = x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("parsing leaf certificate: %v", err)
+	}
 
 	return cert, nil
 }
 
 func init() {
-	caddy.RegisterModule(NameshiftCertGetter{})
+	caddy.RegisterModule(new(NameshiftCertGetter))
 }
 
 type CertificateResponse struct {
@@ -119,16 +219,8 @@ var (
 	domainCertMapMutex sync.RWMutex
 	domainCertMap      map[string]string
 
-	certificatesMutex sync.RWMutex
-	certificates      map[string]*tls.Certificate
-
-	lastAccessMutex sync.RWMutex
-	lastAccess      map[string]time.Time
-
 	hasCertMutex sync.RWMutex
 	hasCert      map[string]bool
-
-	cleanupTicker *time.Ticker
 )
 
 // NameshiftCertGetter can get a certificate via HTTP(S) request.
@@ -153,10 +245,22 @@ type NameshiftCertGetter struct {
 
 	logger *zap.Logger
 	ctx    context.Context
+
+	cache *certificateLRU
+
+	fetchGroup singleflight.Group
+
+	negativeCacheMutex sync.Mutex
+	negativeCache      map[string]time.Time
+
+	renewalMutex sync.Mutex
+	renewals     map[string]bool
+
+	persistenceQueue chan certificatePersistence
 }
 
 // CaddyModule returns the Caddy module information.
-func (hcg NameshiftCertGetter) CaddyModule() caddy.ModuleInfo {
+func (hcg *NameshiftCertGetter) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
 		ID:  "tls.get_certificate.nameshift",
 		New: func() caddy.Module { return new(NameshiftCertGetter) },
@@ -166,52 +270,43 @@ func (hcg NameshiftCertGetter) CaddyModule() caddy.ModuleInfo {
 func (hcg *NameshiftCertGetter) Provision(ctx caddy.Context) error {
 	hcg.ctx = ctx
 	hcg.logger = ctx.Logger(hcg)
+	hcg.cache = newCertificateLRU(maxCertificateCacheBytes)
+	hcg.negativeCache = make(map[string]time.Time)
+	hcg.renewals = make(map[string]bool)
+
+	domainCertMapMutex.Lock()
 	domainCertMap = make(map[string]string)
-	certificates = make(map[string]*tls.Certificate)
-	lastAccess = make(map[string]time.Time)
+	domainCertMapMutex.Unlock()
+	hasCertMutex.Lock()
 	hasCert = make(map[string]bool)
+	hasCertMutex.Unlock()
 
 	if hcg.URL == "" {
 		return fmt.Errorf("URL is required")
 	}
 
-	// Start cleanup goroutine
-	cleanupTicker = time.NewTicker(1 * time.Minute)
-	go func() {
-		for range cleanupTicker.C {
-			certificatesMutex.Lock()
-			lastAccessMutex.Lock()
-			now := time.Now()
-			// Only clear certificates that haven't been accessed in 5 minutes
-			for id, lastUsed := range lastAccess {
-				if now.Sub(lastUsed) > 5*time.Minute {
-					delete(certificates, id)
-					delete(lastAccess, id)
-					hcg.logger.Debug(fmt.Sprintf("Cleared unused certificate from memory cache: %s", id))
-				}
-			}
-			lastAccessMutex.Unlock()
-			certificatesMutex.Unlock()
-		}
-	}()
-
 	if hcg.LocalCache != "" {
 		hcg.logger.Debug("loading local certificates from cache", zap.String("path", hcg.LocalCache))
 
-		files, err := os.ReadDir(hcg.LocalCache)
-		if err != nil {
-			os.MkdirAll(hcg.LocalCache, 0770)
-			hcg.logger.Warn("Could not read local cache dir, creating...")
-			return nil
+		if err := os.MkdirAll(hcg.LocalCache, 0700); err != nil {
+			return fmt.Errorf("creating local certificate cache: %w", err)
 		}
 
+		files, err := os.ReadDir(hcg.LocalCache)
+		if err != nil {
+			return fmt.Errorf("reading local certificate cache: %w", err)
+		}
+
+		domainCertMapMutex.Lock()
+		hasCertMutex.Lock()
 		// Only load domain mapping, not the actual certificates
 		for _, file := range files {
 			if !file.IsDir() {
 				fullname := filepath.Join(hcg.LocalCache, file.Name())
 				contents, err := os.ReadFile(fullname)
 				if err != nil {
-					log.Fatal(err)
+					hcg.logger.Warn("could not read cached certificate", zap.String("path", fullname), zap.Error(err))
+					continue
 				}
 
 				cert, err := tlsCertFromCertAndKeyPEMBundle(contents)
@@ -221,30 +316,55 @@ func (hcg *NameshiftCertGetter) Provision(ctx caddy.Context) error {
 							zap.String("certificate_id", file.Name()),
 							zap.Time("expired_at", cert.Leaf.NotAfter),
 						)
-						os.Remove(fullname)
+						if err := os.Remove(fullname); err != nil {
+							hcg.logger.Warn("could not remove expired cached certificate", zap.String("path", fullname), zap.Error(err))
+						}
 						continue
 					}
 
 					// Only store the domain mapping, not the actual certificate
-					domainCertMapMutex.Lock()
 					for _, element := range cert.Leaf.DNSNames {
 						domainCertMap[element] = file.Name()
+						hasCert[element] = true
 					}
-					domainCertMapMutex.Unlock()
+				} else {
+					hcg.logger.Warn("could not parse cached certificate", zap.String("path", fullname), zap.Error(err))
 				}
 			}
 		}
+		hasCertMutex.Unlock()
+		domainCertMapMutex.Unlock()
+
+		hcg.persistenceQueue = make(chan certificatePersistence, persistenceQueueSize)
+		go hcg.persistCertificates()
 	}
 
 	return nil
 }
 
-func (hcg NameshiftCertGetter) storeCertificateToDisk(id string, cert *[]byte) {
-	os.WriteFile(
-		filepath.Join(hcg.LocalCache, id),
-		*cert,
-		0644,
-	)
+func (hcg *NameshiftCertGetter) persistCertificates() {
+	for {
+		select {
+		case <-hcg.ctx.Done():
+			return
+		case persistence := <-hcg.persistenceQueue:
+			if err := os.WriteFile(filepath.Join(hcg.LocalCache, persistence.id), persistence.data, 0600); err != nil {
+				hcg.logger.Error("could not persist certificate", zap.String("certificate_id", persistence.id), zap.Error(err))
+			}
+		}
+	}
+}
+
+func (hcg *NameshiftCertGetter) queueCertificatePersistence(id string, cert []byte) {
+	if hcg.persistenceQueue == nil {
+		return
+	}
+
+	select {
+	case hcg.persistenceQueue <- certificatePersistence{id: id, data: cert}:
+	default:
+		hcg.logger.Warn("certificate persistence queue is full", zap.String("certificate_id", id))
+	}
 }
 
 func HasCertificate(name string) bool {
@@ -254,19 +374,13 @@ func HasCertificate(name string) bool {
 	return hasCert[name]
 }
 
-func (hcg NameshiftCertGetter) loadCertificateIntoMemoryCache(id string, cert *tls.Certificate) {
-	certificatesMutex.Lock()
-	lastAccessMutex.Lock()
+func (hcg *NameshiftCertGetter) loadCertificateIntoMemoryCache(id string, cert *tls.Certificate, size int64) {
+	hcg.cache.Add(id, cert, size)
+
 	domainCertMapMutex.Lock()
 	hasCertMutex.Lock()
-	defer certificatesMutex.Unlock()
-	defer lastAccessMutex.Unlock()
 	defer domainCertMapMutex.Unlock()
 	defer hasCertMutex.Unlock()
-
-	// store in cache
-	certificates[id] = cert
-	lastAccess[id] = time.Now()
 
 	hcg.logger.Debug("storing certificate in memory cache",
 		zap.String("certificate_id", id),
@@ -281,26 +395,26 @@ func (hcg NameshiftCertGetter) loadCertificateIntoMemoryCache(id string, cert *t
 	}
 }
 
-func (hcg NameshiftCertGetter) loadCertificateFromDisk(id string) (*tls.Certificate, error) {
+func (hcg *NameshiftCertGetter) loadCertificateFromDisk(id string) (*tls.Certificate, int64, error) {
 	if hcg.LocalCache == "" {
-		return nil, fmt.Errorf("no local cache configured")
+		return nil, 0, fmt.Errorf("no local cache configured")
 	}
 
 	fullname := filepath.Join(hcg.LocalCache, id)
 	contents, err := os.ReadFile(fullname)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	cert, err := tlsCertFromCertAndKeyPEMBundle(contents)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
-	return &cert, nil
+	return &cert, int64(len(contents)), nil
 }
 
-func (hcg NameshiftCertGetter) parseCertificateResponse(resp *http.Response) (*tls.Certificate, error) {
+func (hcg *NameshiftCertGetter) parseCertificateResponse(resp *http.Response) (*tls.Certificate, error) {
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("error reading response body: %v", err)
@@ -315,16 +429,16 @@ func (hcg NameshiftCertGetter) parseCertificateResponse(resp *http.Response) (*t
 		return nil, fmt.Errorf("empty certificate in response")
 	}
 
-	cert, err := tlsCertFromCertAndKeyPEMBundle([]byte(result.Certificate))
+	certBytes := []byte(result.Certificate)
+	cert, err := tlsCertFromCertAndKeyPEMBundle(certBytes)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse certificate: %v", err)
 	}
 
 	// is the cert still valid?
 	if time.Now().Before(cert.Leaf.NotAfter) {
-		certBytes := []byte(result.Certificate)
-		hcg.loadCertificateIntoMemoryCache(result.Id, &cert)
-		hcg.storeCertificateToDisk(result.Id, &certBytes)
+		hcg.loadCertificateIntoMemoryCache(result.Id, &cert, int64(len(certBytes)))
+		hcg.queueCertificatePersistence(result.Id, certBytes)
 
 		return &cert, nil
 	}
@@ -335,7 +449,55 @@ func (hcg NameshiftCertGetter) parseCertificateResponse(resp *http.Response) (*t
 	return nil, fmt.Errorf("certificate is expired")
 }
 
-func (hcg NameshiftCertGetter) fetchCertificate(name string) (*tls.Certificate, error) {
+func (hcg *NameshiftCertGetter) isNegativeCached(name string) bool {
+	hcg.negativeCacheMutex.Lock()
+	defer hcg.negativeCacheMutex.Unlock()
+
+	expiresAt, ok := hcg.negativeCache[name]
+	if !ok {
+		return false
+	}
+	if time.Now().After(expiresAt) {
+		delete(hcg.negativeCache, name)
+		return false
+	}
+	return true
+}
+
+func (hcg *NameshiftCertGetter) setNegativeCached(name string) {
+	hcg.negativeCacheMutex.Lock()
+	hcg.negativeCache[name] = time.Now().Add(negativeCacheTTL)
+	hcg.negativeCacheMutex.Unlock()
+}
+
+func (hcg *NameshiftCertGetter) clearNegativeCached(name string) {
+	hcg.negativeCacheMutex.Lock()
+	delete(hcg.negativeCache, name)
+	hcg.negativeCacheMutex.Unlock()
+}
+
+func (hcg *NameshiftCertGetter) fetchCertificate(name string) (*tls.Certificate, error) {
+	if hcg.isNegativeCached(name) {
+		return nil, fmt.Errorf("certificate fetch for %q is temporarily cached as failed", name)
+	}
+
+	value, err, _ := hcg.fetchGroup.Do(name, func() (any, error) {
+		cert, fetchErr := hcg.fetchCertificateOnce(name)
+		if fetchErr != nil {
+			hcg.setNegativeCached(name)
+			return nil, fetchErr
+		}
+		hcg.clearNegativeCached(name)
+		return cert, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return value.(*tls.Certificate), nil
+}
+
+func (hcg *NameshiftCertGetter) fetchCertificateOnce(name string) (*tls.Certificate, error) {
 	hcg.logger.Debug("fetching certificate", zap.String("server_name", name))
 
 	if name == "" {
@@ -371,21 +533,47 @@ func (hcg NameshiftCertGetter) fetchCertificate(name string) (*tls.Certificate, 
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch from API: %v", err)
 	}
+	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusOK {
 		cert, err := hcg.parseCertificateResponse(resp)
 		if err == nil && cert != nil {
-			defer resp.Body.Close()
 			return cert, nil
+		}
+		if err != nil {
+			return nil, err
 		}
 	}
 
-	defer resp.Body.Close()
-
-	return nil, fmt.Errorf("failed to fetch certificate from API")
+	return nil, fmt.Errorf("failed to fetch certificate from API: HTTP %d", resp.StatusCode)
 }
 
-func (hcg NameshiftCertGetter) GetCertificate(ctx context.Context, hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+func (hcg *NameshiftCertGetter) refreshCertificateAsync(name string) {
+	if hcg.isNegativeCached(name) {
+		return
+	}
+
+	hcg.renewalMutex.Lock()
+	if hcg.renewals[name] {
+		hcg.renewalMutex.Unlock()
+		return
+	}
+	hcg.renewals[name] = true
+	hcg.renewalMutex.Unlock()
+
+	go func() {
+		defer func() {
+			hcg.renewalMutex.Lock()
+			delete(hcg.renewals, name)
+			hcg.renewalMutex.Unlock()
+		}()
+		if _, err := hcg.fetchCertificate(name); err != nil {
+			hcg.logger.Warn("background certificate refresh failed", zap.String("server_name", name), zap.Error(err))
+		}
+	}()
+}
+
+func (hcg *NameshiftCertGetter) GetCertificate(ctx context.Context, hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	// check if we have the certificate cached
 	domainCertMapMutex.RLock()
 	certificateId, ok := domainCertMap[hello.ServerName]
@@ -398,40 +586,30 @@ func (hcg NameshiftCertGetter) GetCertificate(ctx context.Context, hello *tls.Cl
 		)
 
 		// Try to get from memory cache first
-		certificatesMutex.RLock()
-		cert := certificates[certificateId]
-		certificatesMutex.RUnlock()
+		cert, _ := hcg.cache.Get(certificateId)
 
 		if cert == nil {
 			// not found in memory, try to load from disk
 			hcg.logger.Debug("certificate not found in memory; loading from disk", zap.String("certificate_id", certificateId))
 
 			var err error
-			cert, err = hcg.loadCertificateFromDisk(certificateId)
+			var size int64
+			cert, size, err = hcg.loadCertificateFromDisk(certificateId)
 			if err == nil {
-				hcg.loadCertificateIntoMemoryCache(certificateId, cert)
+				hcg.loadCertificateIntoMemoryCache(certificateId, cert, size)
 			}
 		}
 
 		if cert != nil {
-			// Update last access time
-			lastAccessMutex.Lock()
-			lastAccess[certificateId] = time.Now()
-			lastAccessMutex.Unlock()
-
 			// check if expired
 			if time.Now().After(cert.Leaf.NotAfter) {
 				hcg.logger.Debug("cached certificate expired; removing",
 					zap.String("server_name", hello.ServerName),
 					zap.String("certificate_id", certificateId),
 				)
-				certificatesMutex.Lock()
-				lastAccessMutex.Lock()
-				hasCertMutex.Lock()
+				hcg.cache.Delete(certificateId)
 				domainCertMapMutex.Lock()
-
-				delete(certificates, certificateId)
-				delete(lastAccess, certificateId)
+				hasCertMutex.Lock()
 
 				// Remove from hasCert map
 				for _, element := range cert.Leaf.DNSNames {
@@ -439,10 +617,8 @@ func (hcg NameshiftCertGetter) GetCertificate(ctx context.Context, hello *tls.Cl
 					delete(domainCertMap, element)
 				}
 
-				certificatesMutex.Unlock()
-				lastAccessMutex.Unlock()
-				hasCertMutex.Unlock()
 				domainCertMapMutex.Unlock()
+				hasCertMutex.Unlock()
 			} else {
 				// expires soon
 				if time.Now().AddDate(0, 0, 5).After(cert.Leaf.NotAfter) {
@@ -451,7 +627,7 @@ func (hcg NameshiftCertGetter) GetCertificate(ctx context.Context, hello *tls.Cl
 						zap.String("certificate_id", certificateId),
 						zap.Time("expires_at", cert.Leaf.NotAfter),
 					)
-					go hcg.fetchCertificate(hello.ServerName)
+					hcg.refreshCertificateAsync(hello.ServerName)
 				}
 
 				return cert, nil
